@@ -1,147 +1,253 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { STUDENTS } from '../students';
-import {
-  getAttendanceStatus,
-  getLocalDateKey,
-  getScheduledStart,
-  hasPassedAbsenceCutoff,
-} from './attendanceSchedule.cjs';
+import { getLocalDateKey, getScheduledStart } from './attendanceSchedule.cjs';
+import { getSupabaseClient } from './supabase';
 
-const SCHEDULE_KEY = '@attendease/attendance-schedule';
-let attendanceWriteQueue = Promise.resolve();
+const PROFILE_COLUMNS = 'id, role, full_name, student_number';
+const SCHEDULE_COLUMNS = 'id, class_date, class_name, starts_at, ends_at';
+const ATTENDANCE_COLUMNS =
+  'id, schedule_id, student_id, status, scanned_at, auto_generated, created_at';
 
-function runSerialized(operation) {
-  const result = attendanceWriteQueue.then(operation, operation);
-  attendanceWriteQueue = result.then(
-    () => undefined,
-    () => undefined
-  );
-  return result;
+let subscriptionSequence = 0;
+
+// ==========================================
+// 1. DATA FETCHING FUNCTIONS
+// ==========================================
+
+export async function getProfile(profileId) {
+  const { data, error } = await getSupabaseClient()
+    .from('profiles')
+    .select(PROFILE_COLUMNS)
+    .eq('id', profileId)
+    .single();
+
+  if (error) throw error;
+  return data;
 }
 
-function getRecordsKey(date, isTest) {
-  return `@attendease/attendance/${isTest ? 'test' : 'real'}/${date}`;
+export async function getClassSchedulesForDate(date = getLocalDateKey(new Date())) {
+  const { data, error } = await getSupabaseClient()
+    .from('class_schedule')
+    .select(SCHEDULE_COLUMNS)
+    .eq('class_date', date)
+    .order('starts_at', { ascending: true });
+
+  if (error) throw error;
+  return data;
 }
 
-async function readRecords(key) {
-  const storedRecords = await AsyncStorage.getItem(key);
-  if (!storedRecords) return [];
+export async function getClassSchedule(scheduleId) {
+  const { data, error } = await getSupabaseClient()
+    .from('class_schedule')
+    .select(SCHEDULE_COLUMNS)
+    .eq('id', scheduleId)
+    .single();
 
-  const records = JSON.parse(storedRecords);
-  if (!Array.isArray(records)) {
-    throw new Error('Saved attendance data is invalid.');
+  if (error) throw error;
+  return data;
+}
+
+export async function saveClassSchedule(
+  className,
+  startTime,
+  endTime,
+  date,
+  teacherId,
+  scheduleId = null
+) {
+  const startsAt = getScheduledStart(date, startTime).toISOString();
+  const endsAt = getScheduledStart(date, endTime).toISOString();
+  if (new Date(endsAt).getTime() <= new Date(startsAt).getTime()) {
+    throw new Error('Class end time must be later than its start time.');
   }
-  return records;
+  const scheduleData = {
+    class_date: date,
+    class_name: className,
+    starts_at: startsAt,
+    ends_at: endsAt,
+    created_by: teacherId,
+  };
+  const query = getSupabaseClient().from('class_schedule');
+  const { data, error } = scheduleId
+    ? await query
+        .update(scheduleData)
+        .eq('id', scheduleId)
+        .select(SCHEDULE_COLUMNS)
+        .single()
+    : await query.insert(scheduleData).select(SCHEDULE_COLUMNS).single();
+
+  if (error) throw error;
+  return data;
 }
 
-export async function getAttendanceSchedule() {
-  await attendanceWriteQueue;
-  const storedSchedule = await AsyncStorage.getItem(SCHEDULE_KEY);
-  if (!storedSchedule) return null;
+export async function getAttendanceForDate(date) {
+  const schedules = await getClassSchedulesForDate(date);
+  if (schedules.length === 0) return { schedules, records: [] };
 
-  const schedule = JSON.parse(storedSchedule);
-  if (
-    !schedule ||
-    typeof schedule.className !== 'string' ||
-    typeof schedule.startTime !== 'string'
-  ) {
-    throw new Error('Saved schedule data is invalid.');
-  }
-  return schedule;
+  const { data: attendance, error: attendanceError } = await getSupabaseClient()
+    .from('attendance')
+    .select(ATTENDANCE_COLUMNS)
+    .in('schedule_id', schedules.map((schedule) => schedule.id))
+    .order('created_at', { ascending: true });
+
+  if (attendanceError) throw attendanceError;
+  if (!attendance.length) return { schedules, records: [] };
+
+  const studentIds = [...new Set(attendance.map((record) => record.student_id))];
+  const { data: profiles, error: profilesError } = await getSupabaseClient()
+    .from('profiles')
+    .select(PROFILE_COLUMNS)
+    .in('id', studentIds);
+
+  if (profilesError) throw profilesError;
+  const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+  const schedulesById = new Map(schedules.map((schedule) => [schedule.id, schedule]));
+
+  return {
+    schedules,
+    records: attendance.map((record) => ({
+      ...record,
+      student: profilesById.get(record.student_id) || null,
+      schedule: schedulesById.get(record.schedule_id) || null,
+    })),
+  };
 }
 
-export async function saveAttendanceSchedule(startTime, className) {
-  await runSerialized(() =>
-    AsyncStorage.setItem(
-      SCHEDULE_KEY,
-      JSON.stringify({
-        className,
-        startTime,
-        updatedAt: new Date().toISOString(),
-      })
-    )
+export async function getAttendanceForSchedule(scheduleId) {
+  const schedule = await getClassSchedule(scheduleId);
+  const result = await getAttendanceForDate(schedule.class_date);
+  return {
+    schedule,
+    records: result.records.filter((record) => record.schedule_id === scheduleId),
+  };
+}
+
+export async function getStudentAttendance(scheduleId, studentId) {
+  if (!scheduleId) return null;
+
+  const { data, error } = await getSupabaseClient()
+    .from('attendance')
+    .select(ATTENDANCE_COLUMNS)
+    .eq('schedule_id', scheduleId)
+    .eq('student_id', studentId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getStudentAttendanceForDate(date, studentId) {
+  const schedules = await getClassSchedulesForDate(date);
+  if (schedules.length === 0) return [];
+
+  const { data: records, error } = await getSupabaseClient()
+    .from('attendance')
+    .select(ATTENDANCE_COLUMNS)
+    .eq('student_id', studentId)
+    .in('schedule_id', schedules.map((schedule) => schedule.id));
+
+  if (error) throw error;
+  const recordsByScheduleId = new Map(
+    records.map((record) => [record.schedule_id, record])
   );
+
+  return schedules.map((schedule) => ({
+    ...schedule,
+    attendance: recordsByScheduleId.get(schedule.id) || null,
+  }));
 }
 
-export async function markAttendance(studentId, studentName, date, startTime, arrivedAt, isTest = false) {
-  const recordsKey = getRecordsKey(date, isTest);
-  const status = getAttendanceStatus(arrivedAt, getScheduledStart(date, startTime));
+export async function recordStudentAttendance(studentNumber, scheduleId) {
+  const { data, error } = await getSupabaseClient().rpc('record_attendance', {
+    p_student_number: studentNumber,
+    p_schedule_id: scheduleId,
+  });
 
-  return runSerialized(async () => {
-    const records = await readRecords(recordsKey);
-    const existingRecord = records.find((record) => record.studentId === studentId);
-    if (existingRecord) {
-      return {
-        status: existingRecord.status,
-        created: false,
-      };
+  if (error) throw error;
+  const record = Array.isArray(data) ? data[0] : data;
+  if (!record) throw new Error('Attendance was not recorded by the server.');
+
+  // The SQL function now returns the exact names your UI expects
+  return record;
+}
+
+// ==========================================
+// 2. HYBRID REALTIME + POLLING (Bulletproof)
+// ==========================================
+
+function subscribeToChanges(channelName, subscriptions, onChange, onError) {
+  const supabase = getSupabaseClient();
+  const uniqueChannelName = `${channelName}-${++subscriptionSequence}`;
+  let channel = supabase.channel(uniqueChannelName);
+
+  // 1. Start the fallback polling (every 3 seconds)
+  const pollInterval = setInterval(() => {
+    onChange();
+  }, 3000);
+
+  // 2. Try the WebSocket Realtime connection
+  for (const subscription of subscriptions) {
+    channel = channel.on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: subscription.table,
+        ...(subscription.filter ? { filter: subscription.filter } : {}),
+      },
+      onChange
+    );
+  }
+
+  channel.subscribe((status, error) => {
+    if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+      const message = error?.message || `Realtime connection ${status.toLowerCase()}.`;
+      console.warn(`Realtime unavailable. Using 3s background polling instead: ${message}`);
+      if (onError) onError(message);
     }
+  });
 
-    records.push({
-      studentId,
-      name: studentName,
-      status,
-      timeIn: arrivedAt.toLocaleTimeString(),
-      timestamp: arrivedAt.toISOString(),
+  return () => {
+    clearInterval(pollInterval); // Stop polling when the screen unmounts
+    void supabase.removeChannel(channel).catch((error) => {
+      console.warn(`Unable to remove Supabase channel:`, error);
     });
-    await AsyncStorage.setItem(recordsKey, JSON.stringify(records));
-    return { status, created: true };
-  });
+  };
 }
 
-export async function syncAutomaticAbsences(date, startTime, now, isTest = false) {
-  const today = getLocalDateKey(now);
-  if (date > today || (isTest && date !== today)) return 0;
+export function subscribeToStudentAttendance(studentId, date, onChange, onError) {
+  const subscriptions = [
+    { table: 'class_schedule', filter: `class_date=eq.${date}` },
+    { table: 'attendance', filter: `student_id=eq.${studentId}` },
+  ];
 
-  const cutoffPassed = hasPassedAbsenceCutoff(now, getScheduledStart(date, startTime));
-  const recordsKey = getRecordsKey(date, isTest);
-
-  return runSerialized(async () => {
-    const records = await readRecords(recordsKey);
-
-    if (!cutoffPassed) {
-      const currentRecords = records.filter((record) => !record.autoGeneratedAbsent);
-      if (currentRecords.length !== records.length) {
-        await AsyncStorage.setItem(recordsKey, JSON.stringify(currentRecords));
-      }
-      return 0;
-    }
-
-    const recordedStudentIds = new Set(records.map((record) => record.studentId));
-    let createdCount = 0;
-    for (const student of STUDENTS) {
-      if (recordedStudentIds.has(student.id)) continue;
-      records.push({
-        studentId: student.id,
-        name: student.name,
-        status: 'Absent',
-        timeIn: '',
-        timestamp: now.toISOString(),
-        autoGeneratedAbsent: true,
-      });
-      createdCount += 1;
-    }
-
-    if (createdCount > 0) {
-      await AsyncStorage.setItem(recordsKey, JSON.stringify(records));
-    }
-    return createdCount;
-  });
-}
-
-export async function getAttendanceByDate(date, isTest = false) {
-  await attendanceWriteQueue;
-  const records = await readRecords(getRecordsKey(date, isTest));
-  return records.sort((first, second) =>
-    String(first.name || '').localeCompare(String(second.name || ''))
+  return subscribeToChanges(
+    `student-attendance-${studentId}-${date}`,
+    subscriptions,
+    onChange,
+    onError
   );
 }
 
-export async function clearTestAttendanceForDate(date) {
-  const recordsKey = getRecordsKey(date, true);
-  return runSerialized(async () => {
-    const records = await readRecords(recordsKey);
-    await AsyncStorage.removeItem(recordsKey);
-    return records.length;
-  });
+export function subscribeToDateAttendance(date, _scheduleId, onChange, onError) {
+  const subscriptions = [{ table: 'class_schedule', filter: `class_date=eq.${date}` }];
+  subscriptions.push({ table: 'attendance' });
+
+  return subscribeToChanges(
+    `attendance-date-${date}`,
+    subscriptions,
+    onChange,
+    onError
+  );
+}
+
+export function subscribeToScheduleAttendance(scheduleId, onChange, onError) {
+  return subscribeToChanges(
+    `attendance-schedule-${scheduleId}`,
+    [{ table: 'attendance', filter: `schedule_id=eq.${scheduleId}` }],
+    onChange,
+    onError
+  );
+}
+
+export function subscribeToTeacherAttendance(date, scheduleId, onChange, onError) {
+  return subscribeToDateAttendance(date, scheduleId, onChange, onError);
 }

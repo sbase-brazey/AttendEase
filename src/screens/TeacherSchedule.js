@@ -1,67 +1,65 @@
 import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   ScrollView,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
 import {
-  addMinutesToTime,
-  getEffectiveNow,
   getLocalDateKey,
   isValidTime,
+  isValidTimeRange,
 } from '../utils/attendanceSchedule.cjs';
-import {
-  clearTestAttendanceForDate,
-  getAttendanceSchedule,
-  markAttendance,
-  saveAttendanceSchedule,
-  syncAutomaticAbsences,
-} from '../utils/attendance';
-import { getTestClock, saveTestClock } from '../utils/testClock';
-import { STUDENTS } from '../students';
+import { getClassSchedulesForDate, saveClassSchedule } from '../utils/attendance';
+import { colors } from '../theme';
 
 function getCurrentTime() {
   const now = new Date();
   return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 }
 
-export default function TeacherSchedule() {
+function getTimeOneHourLater(time) {
+  const [hours, minutes] = time.split(':').map(Number);
+  const totalMinutes = Math.min(hours * 60 + minutes + 60, 23 * 60 + 59);
+  return `${String(Math.floor(totalMinutes / 60)).padStart(2, '0')}:${String(totalMinutes % 60).padStart(2, '0')}`;
+}
+
+function getScheduleTime(schedule, field) {
+  const time = new Date(schedule[field]);
+  return `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+}
+
+function sortSchedules(schedules) {
+  return [...schedules].sort(
+    (first, second) => new Date(first.starts_at).getTime() - new Date(second.starts_at).getTime()
+  );
+}
+
+export default function TeacherSchedule({ route, navigation }) {
+  const { profile } = route.params;
   const [className, setClassName] = useState('');
-  const [savedClassName, setSavedClassName] = useState('');
-  const [startTime, setStartTime] = useState('08:00');
-  const [savedStartTime, setSavedStartTime] = useState('');
-  const [testClock, setTestClock] = useState({ enabled: false, time: getCurrentTime() });
+  const [startTime, setStartTime] = useState(getCurrentTime);
+  const [endTime, setEndTime] = useState(() => getTimeOneHourLater(getCurrentTime()));
+  const [schedules, setSchedules] = useState([]);
+  const [editingScheduleId, setEditingScheduleId] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [savingSchedule, setSavingSchedule] = useState(false);
-  const [savingTestClock, setSavingTestClock] = useState(false);
-  const [simulatingStudentId, setSimulatingStudentId] = useState('');
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const date = getLocalDateKey(new Date());
 
   useEffect(() => {
     let active = true;
 
-    Promise.all([getAttendanceSchedule(), getTestClock()])
-      .then(([schedule, savedTestClock]) => {
-        if (!active) return;
-        if (schedule?.startTime) {
-          setStartTime(schedule.startTime);
-          setSavedStartTime(schedule.startTime);
-        }
-        if (typeof schedule?.className === 'string') {
-          setClassName(schedule.className);
-          setSavedClassName(schedule.className);
-        }
-        setTestClock(savedTestClock);
+    getClassSchedulesForDate(date)
+      .then((savedSchedules) => {
+        if (active) setSchedules(savedSchedules);
       })
       .catch((loadError) => {
-        if (active) setError(`Could not load schedule settings: ${loadError.message}`);
+        if (active) setError(`Could not load today's schedules: ${loadError.message}`);
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -70,295 +68,223 @@ export default function TeacherSchedule() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [date]);
 
-  const updateTestClock = async (nextClock) => {
-    setSavingTestClock(true);
+  const startNewSchedule = () => {
+    setEditingScheduleId(null);
+    setClassName('');
+    const newStartTime = getCurrentTime();
+    setStartTime(newStartTime);
+    setEndTime(getTimeOneHourLater(newStartTime));
     setError('');
     setNotice('');
-    try {
-      await saveTestClock(nextClock);
-      setTestClock(nextClock);
+  };
 
-      if (savedStartTime) {
-        const now = getEffectiveNow(nextClock);
-        await syncAutomaticAbsences(
-          getLocalDateKey(now),
-          savedStartTime,
-          now,
-          nextClock.enabled
-        );
-      }
-
-      setNotice(
-        nextClock.enabled
-          ? 'Test clock enabled. Simulated attendance is stored separately from real records.'
-          : 'Test clock disabled. New scans will use real time and real attendance records.'
-      );
-    } catch (saveError) {
-      setError(`Could not update the test clock: ${saveError.message}`);
-    } finally {
-      setSavingTestClock(false);
-    }
+  const editSchedule = (schedule) => {
+    setEditingScheduleId(schedule.id);
+    setClassName(schedule.class_name);
+    setStartTime(getScheduleTime(schedule, 'starts_at'));
+    setEndTime(getScheduleTime(schedule, 'ends_at'));
+    setError('');
+    setNotice('');
   };
 
   const handleSaveSchedule = async () => {
-    if (!className.trim()) {
-      setError('Enter a class name.');
+    const trimmedClassName = className.trim();
+    if (!trimmedClassName) {
+      setError('Enter the subject or class name.');
+      setNotice('');
+      return;
+    }
+    if (!isValidTime(startTime) || !isValidTime(endTime)) {
+      setError('Enter both class times in 24-hour HH:MM format.');
+      setNotice('');
+      return;
+    }
+    if (!isValidTimeRange(startTime, endTime)) {
+      setError('Class end time must be later than its start time.');
       setNotice('');
       return;
     }
 
-    if (!isValidTime(startTime)) {
-      setError('Enter the daily class start time in 24-hour HH:MM format.');
-      setNotice('');
-      return;
-    }
-
-    setSavingSchedule(true);
+    setSaving(true);
     setError('');
     setNotice('');
     try {
-      const trimmedClassName = className.trim();
-      await saveAttendanceSchedule(startTime, trimmedClassName);
-      setClassName(trimmedClassName);
-      setSavedClassName(trimmedClassName);
-      setSavedStartTime(startTime);
-      const now = getEffectiveNow(testClock);
-      await syncAutomaticAbsences(
-        getLocalDateKey(now),
+      const savedSchedule = await saveClassSchedule(
+        trimmedClassName,
         startTime,
-        now,
-        testClock.enabled
+        endTime,
+        date,
+        profile.id,
+        editingScheduleId
       );
-      setNotice(`Schedule saved for ${trimmedClassName} at ${startTime}.`);
+      setSchedules((current) =>
+        sortSchedules([
+          ...current.filter((schedule) => schedule.id !== savedSchedule.id),
+          savedSchedule,
+        ])
+      );
+      if (editingScheduleId) {
+        setEditingScheduleId(savedSchedule.id);
+        setClassName(savedSchedule.class_name);
+        setStartTime(getScheduleTime(savedSchedule, 'starts_at'));
+        setEndTime(getScheduleTime(savedSchedule, 'ends_at'));
+        setNotice(`${savedSchedule.class_name} schedule updated.`);
+      } else {
+        setClassName('');
+        const newStartTime = getCurrentTime();
+        setStartTime(newStartTime);
+        setEndTime(getTimeOneHourLater(newStartTime));
+        setNotice(`${savedSchedule.class_name} added to today's schedule.`);
+      }
     } catch (saveError) {
       setError(`Could not save the schedule: ${saveError.message}`);
     } finally {
-      setSavingSchedule(false);
+      setSaving(false);
     }
   };
-
-  const adjustTestTime = (minutes) => {
-    updateTestClock({
-      ...testClock,
-      enabled: true,
-      time: addMinutesToTime(testClock.time, minutes),
-    });
-  };
-
-  const resetTestTime = () => {
-    updateTestClock({ ...testClock, enabled: true, time: getCurrentTime() });
-  };
-
-  const simulateCheckIn = async (student) => {
-    if (!savedStartTime || !testClock.enabled) return;
-
-    setSimulatingStudentId(student.id);
-    setError('');
-    setNotice('');
-    try {
-      const now = getEffectiveNow(testClock);
-      const date = getLocalDateKey(now);
-      await syncAutomaticAbsences(date, savedStartTime, now, true);
-      const result = await markAttendance(
-        student.id,
-        student.name,
-        date,
-        savedStartTime,
-        now,
-        true
-      );
-      setNotice(
-        result.created
-          ? `${student.name} simulated as ${result.status}.`
-          : `${student.name} is already recorded as ${result.status} in test records.`
-      );
-    } catch (checkInError) {
-      setError(`Could not simulate check-in: ${checkInError.message}`);
-    } finally {
-      setSimulatingStudentId('');
-    }
-  };
-
-  const confirmClearTestRecords = () => {
-    Alert.alert(
-      'Clear today’s test records?',
-      'This only removes simulated records. Real attendance is not changed.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Clear test records',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              const now = getEffectiveNow(testClock);
-              const removed = await clearTestAttendanceForDate(getLocalDateKey(now));
-              setNotice(`${removed} test record${removed === 1 ? '' : 's'} cleared.`);
-              setError('');
-            } catch (clearError) {
-              setError(`Could not clear test records: ${clearError.message}`);
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  if (loading) {
-    return (
-      <View style={styles.loading}>
-        <ActivityIndicator size="large" color="#1A56DB" />
-        <Text>Loading schedule settings...</Text>
-      </View>
-    );
-  }
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
-      <Text style={styles.title}>Daily Class Schedule</Text>
-      <Text style={styles.description}>
-        This shared start time applies to all students every day.
-      </Text>
+    <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+      <View style={styles.heading}>
+        <Text style={styles.eyebrow}>TEACHER TOOLS</Text>
+        <Text style={styles.title}>Class schedule</Text>
+        <Text style={styles.subtitle}>
+          Add each subject separately. Every subject gets its own attendance records.
+        </Text>
+      </View>
 
-      <View style={styles.card}>
-        <Text style={styles.label}>Class name</Text>
+      <View style={styles.infoCard}>
+        <Text style={styles.infoTitle}>Attendance policy</Text>
+        <View style={styles.policyRow}>
+          <View style={[styles.dot, { backgroundColor: colors.present }]} />
+          <Text style={styles.policyText}>Before start or through 15 min after: Present</Text>
+        </View>
+        <View style={styles.policyRow}>
+          <View style={[styles.dot, { backgroundColor: colors.late }]} />
+          <Text style={styles.policyText}>After 15 min, through class end: Late</Text>
+        </View>
+        <View style={styles.policyRow}>
+          <View style={[styles.dot, { backgroundColor: colors.absent }]} />
+          <Text style={styles.policyText}>No attendance by class end: Absent</Text>
+        </View>
+      </View>
+
+      <View style={styles.sectionHeading}>
+        <View>
+          <Text style={styles.sectionTitle}>Today&apos;s subjects</Text>
+          <Text style={styles.date}>{date}</Text>
+        </View>
+        <TouchableOpacity accessibilityRole="button" onPress={startNewSchedule}>
+          <Text style={styles.addButton}>+ Add subject</Text>
+        </TouchableOpacity>
+      </View>
+
+      {loading ? (
+        <ActivityIndicator size="large" color={colors.primary} />
+      ) : schedules.length === 0 ? (
+        <View style={styles.emptyCard}>
+          <Text style={styles.emptyTitle}>No subjects scheduled yet</Text>
+          <Text style={styles.emptyText}>Add the first subject using the form below.</Text>
+        </View>
+      ) : (
+        <View style={styles.scheduleList}>
+          {schedules.map((schedule) => (
+            <View key={schedule.id} style={styles.scheduleCard}>
+              <View style={styles.scheduleCopy}>
+                <Text style={styles.scheduleName}>{schedule.class_name}</Text>
+                <Text style={styles.scheduleTime}>
+                  {new Date(schedule.starts_at).toLocaleTimeString([], {
+                    hour: 'numeric',
+                    minute: '2-digit',
+                  })}
+                  {' – '}
+                  {new Date(schedule.ends_at).toLocaleTimeString([], {
+                    hour: 'numeric',
+                    minute: '2-digit',
+                  })}
+                </Text>
+              </View>
+              <TouchableOpacity
+                accessibilityRole="button"
+                style={styles.viewButton}
+                onPress={() =>
+                  navigation.navigate('ClassAttendance', { profile, scheduleId: schedule.id })
+                }
+              >
+                <Text style={styles.viewButtonText}>Records</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                accessibilityRole="button"
+                style={styles.editButton}
+                onPress={() => editSchedule(schedule)}
+              >
+                <Text style={styles.editButtonText}>Edit</Text>
+              </TouchableOpacity>
+            </View>
+          ))}
+        </View>
+      )}
+
+      <View style={styles.formCard}>
+        <Text style={styles.formTitle}>
+          {editingScheduleId ? 'Edit subject' : 'Add a subject'}
+        </Text>
+        <Text style={styles.label}>Subject or class name</Text>
         <TextInput
-          accessibilityLabel="Class name"
+          accessibilityLabel="Subject or class name"
           style={styles.input}
           value={className}
           onChangeText={setClassName}
           placeholder="e.g. Mathematics 101"
-          maxLength={60}
+          placeholderTextColor={colors.muted}
+          maxLength={80}
           autoCapitalize="words"
         />
-        <Text style={styles.label}>Class start time (24-hour HH:MM)</Text>
+        <Text style={styles.label}>Class start time</Text>
         <TextInput
-          accessibilityLabel="Daily class start time"
+          accessibilityLabel="Class start time"
           style={styles.input}
           value={startTime}
           onChangeText={setStartTime}
           placeholder="08:00"
+          placeholderTextColor={colors.muted}
           maxLength={5}
+          keyboardType="numbers-and-punctuation"
           autoCapitalize="none"
         />
-        <Text style={styles.helper}>
-          On time: Present. After start through 15 minutes: Late. More than 15 minutes late:
-          Absent.
-        </Text>
+        <Text style={styles.label}>Class end time</Text>
+        <TextInput
+          accessibilityLabel="Class end time"
+          style={styles.input}
+          value={endTime}
+          onChangeText={setEndTime}
+          placeholder="09:00"
+          placeholderTextColor={colors.muted}
+          maxLength={5}
+          keyboardType="numbers-and-punctuation"
+          autoCapitalize="none"
+        />
         <TouchableOpacity
           accessibilityRole="button"
-          style={[styles.primaryButton, savingSchedule && styles.disabledButton]}
+          style={[styles.button, saving && styles.disabled]}
           onPress={handleSaveSchedule}
-          disabled={savingSchedule}
+          disabled={saving}
         >
-          <Text style={styles.primaryButtonText}>
-            {savingSchedule ? 'Saving...' : 'Save Daily Schedule'}
-          </Text>
+          {saving ? (
+            <ActivityIndicator color={colors.surface} />
+          ) : (
+            <Text style={styles.buttonText}>
+              {editingScheduleId ? 'Update subject' : 'Add subject'}
+            </Text>
+          )}
         </TouchableOpacity>
-        <Text style={styles.savedText}>
-          {savedStartTime
-            ? savedClassName
-              ? `Saved schedule: ${savedClassName} · ${savedStartTime}`
-              : `Saved start time: ${savedStartTime}. Add a class name and save to complete the schedule.`
-            : 'No schedule saved yet. Save a class name and start time to enable attendance timing.'}
-        </Text>
-      </View>
-
-      <View style={styles.card}>
-        <View style={styles.switchRow}>
-          <View style={styles.switchCopy}>
-            <Text style={styles.sectionTitle}>Test clock</Text>
-            <Text style={styles.helper}>
-              Test scans and automatic absences are saved separately from real attendance.
-            </Text>
-          </View>
-          <Switch
-            accessibilityLabel="Enable test clock"
-            value={testClock.enabled}
-            onValueChange={(enabled) => updateTestClock({ ...testClock, enabled })}
-            disabled={savingTestClock}
-          />
-        </View>
-
-        {testClock.enabled && (
-          <View style={styles.testControls}>
-            <Text style={styles.label}>Simulated local time (HH:MM)</Text>
-            <TextInput
-              accessibilityLabel="Simulated time"
-              style={styles.input}
-              value={testClock.time}
-              onChangeText={(time) => setTestClock({ ...testClock, time })}
-              onEndEditing={() => {
-                if (isValidTime(testClock.time)) {
-                  updateTestClock(testClock);
-                } else {
-                  setError('Enter a valid simulated time in 24-hour HH:MM format.');
-                }
-              }}
-              placeholder="08:00"
-              maxLength={5}
-              autoCapitalize="none"
-            />
-            <View style={styles.buttonRow}>
-              <TouchableOpacity
-                accessibilityRole="button"
-                style={styles.secondaryButton}
-                onPress={() => adjustTestTime(-5)}
-                disabled={savingTestClock}
-              >
-                <Text style={styles.secondaryButtonText}>−5 min</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                accessibilityRole="button"
-                style={styles.secondaryButton}
-                onPress={() => adjustTestTime(5)}
-                disabled={savingTestClock}
-              >
-                <Text style={styles.secondaryButtonText}>+5 min</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                accessibilityRole="button"
-                style={styles.secondaryButton}
-                onPress={resetTestTime}
-                disabled={savingTestClock}
-              >
-                <Text style={styles.secondaryButtonText}>Use current time</Text>
-              </TouchableOpacity>
-            </View>
-            <Text style={styles.helper}>
-              Simulated time: {getEffectiveNow(testClock).toLocaleTimeString()}. Turn test mode
-              off before recording real attendance.
-            </Text>
-            <Text style={styles.label}>Test student arrival at this time</Text>
-            {STUDENTS.map((student) => (
-              <View key={student.id} style={styles.studentRow}>
-                <Text style={styles.studentName}>{student.name}</Text>
-                <TouchableOpacity
-                  accessibilityRole="button"
-                  style={[
-                    styles.secondaryButton,
-                    (!savedStartTime || savingTestClock || simulatingStudentId !== '') &&
-                      styles.disabledButton,
-                  ]}
-                  onPress={() => simulateCheckIn(student)}
-                  disabled={!savedStartTime || savingTestClock || simulatingStudentId !== ''}
-                >
-                  <Text style={styles.secondaryButtonText}>
-                    {simulatingStudentId === student.id ? 'Saving...' : 'Simulate check-in'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            ))}
-            <TouchableOpacity
-              accessibilityRole="button"
-              style={styles.clearButton}
-              onPress={confirmClearTestRecords}
-            >
-              <Text style={styles.clearButtonText}>Clear today’s test records</Text>
-            </TouchableOpacity>
-          </View>
-        )}
+        {editingScheduleId ? (
+          <TouchableOpacity accessibilityRole="button" onPress={startNewSchedule}>
+            <Text style={styles.cancelText}>Cancel editing</Text>
+          </TouchableOpacity>
+        ) : null}
       </View>
 
       {!!error && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
@@ -368,43 +294,78 @@ export default function TeacherSchedule() {
 }
 
 const styles = StyleSheet.create({
-  container: { flexGrow: 1, padding: 20, backgroundColor: '#f5f5f5', gap: 16 },
-  loading: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12 },
-  title: { color: '#222', fontSize: 24, fontWeight: 'bold' },
-  description: { color: '#666', fontSize: 15 },
-  card: { padding: 18, borderRadius: 14, backgroundColor: '#fff', gap: 12, elevation: 2 },
-  label: { color: '#333', fontSize: 15, fontWeight: '600' },
-  input: {
-    minHeight: 48,
-    paddingHorizontal: 12,
-    borderWidth: 1,
-    borderColor: '#ccd2dc',
-    borderRadius: 8,
-    color: '#222',
-    fontSize: 18,
-  },
-  helper: { color: '#666', lineHeight: 21 },
-  primaryButton: { padding: 14, borderRadius: 8, alignItems: 'center', backgroundColor: '#1A56DB' },
-  disabledButton: { opacity: 0.6 },
-  primaryButtonText: { color: '#fff', fontWeight: 'bold' },
-  savedText: { color: '#555', fontSize: 13 },
-  switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
-  switchCopy: { flex: 1, gap: 4 },
-  sectionTitle: { color: '#222', fontSize: 18, fontWeight: 'bold' },
-  testControls: { gap: 12, paddingTop: 12 },
-  buttonRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  studentRow: {
+  container: { flexGrow: 1, padding: 20, gap: 16, backgroundColor: colors.background },
+  heading: { gap: 5, marginBottom: 2 },
+  eyebrow: { color: colors.primary, fontSize: 11, fontWeight: '800', letterSpacing: 1.2 },
+  title: { color: colors.text, fontSize: 28, fontWeight: '800', letterSpacing: -0.5 },
+  subtitle: { color: colors.muted, fontSize: 14, lineHeight: 20 },
+  infoCard: { padding: 18, gap: 10, borderRadius: 16, backgroundColor: colors.navy },
+  infoTitle: { marginBottom: 2, color: colors.surface, fontSize: 16, fontWeight: '700' },
+  policyRow: { flexDirection: 'row', alignItems: 'center', gap: 9 },
+  dot: { width: 8, height: 8, borderRadius: 4 },
+  policyText: { color: '#E8EEF7', fontSize: 13 },
+  sectionHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  sectionTitle: { color: colors.text, fontSize: 18, fontWeight: '800' },
+  date: { marginTop: 3, color: colors.muted, fontSize: 12 },
+  addButton: { color: colors.primary, fontSize: 13, fontWeight: '800' },
+  scheduleList: { gap: 9 },
+  scheduleCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-    paddingVertical: 6,
+    padding: 13,
+    gap: 7,
+    borderRadius: 14,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
   },
-  studentName: { flex: 1, color: '#333' },
-  secondaryButton: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, backgroundColor: '#e8eefc' },
-  secondaryButtonText: { color: '#1A56DB', fontWeight: '600' },
-  clearButton: { alignItems: 'center', padding: 10 },
-  clearButtonText: { color: '#b42318', fontWeight: '600' },
-  error: { color: '#b42318', lineHeight: 21 },
-  notice: { color: '#137333', lineHeight: 21 },
+  scheduleCopy: { flex: 1, gap: 3 },
+  scheduleName: { color: colors.text, fontSize: 14, fontWeight: '700' },
+  scheduleTime: { color: colors.muted, fontSize: 12 },
+  viewButton: { paddingVertical: 9, paddingHorizontal: 10, borderRadius: 9, backgroundColor: '#E8EEFA' },
+  viewButtonText: { color: colors.primary, fontSize: 11, fontWeight: '700' },
+  editButton: { paddingVertical: 9, paddingHorizontal: 10, borderRadius: 9, backgroundColor: colors.pendingBackground },
+  editButtonText: { color: colors.text, fontSize: 11, fontWeight: '700' },
+  emptyCard: { alignItems: 'center', padding: 18, gap: 5, borderRadius: 14, backgroundColor: colors.surface },
+  emptyTitle: { color: colors.text, fontSize: 14, fontWeight: '700' },
+  emptyText: { color: colors.muted, fontSize: 12, textAlign: 'center' },
+  formCard: {
+    padding: 18,
+    gap: 12,
+    borderRadius: 18,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  formTitle: { color: colors.text, fontSize: 18, fontWeight: '800' },
+  label: { color: colors.text, fontSize: 13, fontWeight: '700' },
+  input: {
+    minHeight: 50,
+    paddingHorizontal: 13,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: '#FAFBFD',
+    color: colors.text,
+    fontSize: 15,
+  },
+  button: {
+    minHeight: 50,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 4,
+    borderRadius: 11,
+    backgroundColor: colors.primary,
+  },
+  disabled: { opacity: 0.6 },
+  buttonText: { color: colors.surface, fontSize: 14, fontWeight: '700' },
+  cancelText: { color: colors.muted, textAlign: 'center', fontSize: 12, fontWeight: '600' },
+  error: {
+    padding: 12,
+    borderRadius: 10,
+    backgroundColor: colors.absentBackground,
+    color: colors.absent,
+    lineHeight: 20,
+  },
+  notice: { color: colors.present, fontSize: 13, lineHeight: 19 },
 });

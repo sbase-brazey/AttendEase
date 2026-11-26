@@ -8,6 +8,11 @@ function isValidTime(value) {
   return true;
 }
 
+function isValidTimeRange(startTime, endTime) {
+  if (!isValidTime(startTime) || !isValidTime(endTime)) return false;
+  return endTime > startTime;
+}
+
 function getScheduledStart(date, time) {
   if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !isValidTime(time)) {
     throw new Error('Use a valid date and a start time in HH:MM format.');
@@ -28,15 +33,15 @@ function getScheduledStart(date, time) {
   return scheduledStart;
 }
 
-function getAttendanceStatus(arrivedAt, scheduledStart) {
+function getAttendanceStatus(arrivedAt, scheduledStart, scheduledEnd) {
   const difference = arrivedAt.getTime() - scheduledStart.getTime();
-  if (difference <= 0) return 'Present';
-  if (difference <= GRACE_PERIOD_MS) return 'Late';
+  if (difference <= GRACE_PERIOD_MS) return 'Present';
+  if (arrivedAt.getTime() <= scheduledEnd.getTime()) return 'Late';
   return 'Absent';
 }
 
-function hasPassedAbsenceCutoff(now, scheduledStart) {
-  return now.getTime() > scheduledStart.getTime() + GRACE_PERIOD_MS;
+function hasPassedAbsenceCutoff(now, scheduledEnd) {
+  return now.getTime() > scheduledEnd.getTime();
 }
 
 function getLocalDateKey(date) {
@@ -47,32 +52,12 @@ function getLocalDateKey(date) {
   ].join('-');
 }
 
-function getEffectiveNow(testClock, actualNow = new Date()) {
-  if (!testClock?.enabled) return actualNow;
-  if (!isValidTime(testClock.time)) {
-    throw new Error('The test clock time is invalid. Use HH:MM format.');
-  }
-
-  const [hours, minutes] = testClock.time.split(':').map(Number);
-  const simulatedNow = new Date(actualNow);
-  simulatedNow.setHours(hours, minutes, 0, 0);
-  return simulatedNow;
-}
-
-function addMinutesToTime(time, minutesToAdd) {
-  if (!isValidTime(time)) throw new Error('Use a valid time in HH:MM format.');
-  const [hours, minutes] = time.split(':').map(Number);
-  const totalMinutes = (hours * 60 + minutes + minutesToAdd + 1440) % 1440;
-  return `${String(Math.floor(totalMinutes / 60)).padStart(2, '0')}:${String(totalMinutes % 60).padStart(2, '0')}`;
-}
-
 module.exports = {
   GRACE_PERIOD_MINUTES,
-  addMinutesToTime,
   getAttendanceStatus,
-  getEffectiveNow,
   getLocalDateKey,
   getScheduledStart,
   hasPassedAbsenceCutoff,
   isValidTime,
+  isValidTimeRange,
 };

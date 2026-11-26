@@ -1,42 +1,44 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  addMinutesToTime,
   getAttendanceStatus,
-  getEffectiveNow,
   getScheduledStart,
   hasPassedAbsenceCutoff,
   isValidTime,
+  isValidTimeRange,
 } = require('./attendanceSchedule.cjs');
 
 const start = getScheduledStart('2026-11-16', '08:00');
+const end = getScheduledStart('2026-11-16', '09:00');
 
 test('validates 24-hour schedule times', () => {
   assert.equal(isValidTime('08:00'), true);
   assert.equal(isValidTime('23:59'), true);
   assert.equal(isValidTime('24:00'), false);
   assert.equal(isValidTime('8:00'), false);
+  assert.equal(isValidTimeRange('08:00', '09:00'), true);
+  assert.equal(isValidTimeRange('09:00', '08:00'), false);
+  assert.equal(isValidTimeRange('08:00', '08:00'), false);
 });
 
-test('classifies on-time arrival as Present and arrivals through 15 minutes as Late', () => {
-  assert.equal(getAttendanceStatus(new Date('2026-11-16T08:00:00'), start), 'Present');
-  assert.equal(getAttendanceStatus(new Date('2026-11-16T08:01:00'), start), 'Late');
-  assert.equal(getAttendanceStatus(new Date('2026-11-16T08:15:00'), start), 'Late');
+test('marks arrival within the first 15 minutes as Present', () => {
+  assert.equal(getAttendanceStatus(start, start), 'Present');
+  assert.equal(getAttendanceStatus(new Date(start.getTime() + 1), start, end), 'Present');
+  assert.equal(
+    getAttendanceStatus(new Date(start.getTime() + 15 * 60 * 1000), start, end),
+    'Present'
+  );
 });
 
-test('classifies arrival after the 15-minute grace period as Absent', () => {
-  assert.equal(getAttendanceStatus(new Date('2026-11-16T08:15:01'), start), 'Absent');
-  assert.equal(hasPassedAbsenceCutoff(new Date('2026-11-16T08:15:00'), start), false);
-  assert.equal(hasPassedAbsenceCutoff(new Date('2026-11-16T08:15:01'), start), true);
+test('marks arrival after the grace period but before class end Late', () => {
+  const afterGrace = new Date(start.getTime() + 15 * 60 * 1000 + 1);
+  assert.equal(getAttendanceStatus(afterGrace, start, end), 'Late');
+  assert.equal(getAttendanceStatus(end, start, end), 'Late');
 });
 
-test('test clock overrides only the local time and adjusts across midnight', () => {
-  const actualNow = new Date(2026, 10, 16, 9, 30);
-  const testNow = getEffectiveNow({ enabled: true, time: '08:15' }, actualNow);
-  assert.equal(testNow.getFullYear(), 2026);
-  assert.equal(testNow.getMonth(), 10);
-  assert.equal(testNow.getDate(), 16);
-  assert.equal(testNow.getHours(), 8);
-  assert.equal(testNow.getMinutes(), 15);
-  assert.equal(addMinutesToTime('23:58', 5), '00:03');
+test('marks arrival after class end Absent and uses class end for automatic absences', () => {
+  const afterEnd = new Date(end.getTime() + 1);
+  assert.equal(getAttendanceStatus(afterEnd, start, end), 'Absent');
+  assert.equal(hasPassedAbsenceCutoff(end, end), false);
+  assert.equal(hasPassedAbsenceCutoff(afterEnd, end), true);
 });

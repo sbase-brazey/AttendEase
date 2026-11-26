@@ -1,0 +1,18 @@
+export const colors = {
+  background: '#F3F6FB',
+  surface: '#FFFFFF',
+  primary: '#2457D6',
+  primaryDark: '#173A91',
+  navy: '#10233F',
+  text: '#152238',
+  muted: '#66758A',
+  border: '#DFE6EF',
+  present: '#147A4A',
+  presentBackground: '#E4F5EC',
+  late: '#9A5A00',
+  lateBackground: '#FFF2D6',
+  absent: '#B42332',
+  absentBackground: '#FDE9EB',
+  pending: '#52647A',
+  pendingBackground: '#EAF0F6',
+};
